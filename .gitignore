@@ -22,5 +22,7 @@ Thumbs.db
 # gimp
 .xcf
 
+# Identifiers and system files
+.identifier
+.DS_Store
 *:Zone.Identifier
- 
