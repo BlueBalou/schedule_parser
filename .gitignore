@@ -11,11 +11,14 @@ env/
 debug_cells.png
  
 # Screenshots and input images
-*.png
-*.jpg
-*.jpeg
+*./.png
+*./.jpg
+*./.jpeg
  
 # OS
 .DS_Store
 Thumbs.db
+
+# gimp
+.xcf
  

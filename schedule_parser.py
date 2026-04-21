@@ -2,291 +2,251 @@
 """
 Schedule Parser for Vitéz Steven
 ---------------------------------
-Reads a schedule screenshot where:
-  - The first visible day column header is highlighted BLUE
-  - Steven's name cell is highlighted BLUE
-Derives the full grid from those two anchors and outputs a Google Calendar CSV.
+Uses TWO MAGENTA (#ff00ff) anchor blocks and reference cell images to extract
+schedule data from a screenshot and produce a Google Calendar CSV.
+
+PREPARATION:
+  1. Place reference cell images (24x24 PNG) in ./refimages/
+  2. Open the schedule screenshot in GIMP
+  3. Paint TWO 24x24 magenta (#ff00ff) filled rectangles:
+     - One directly ABOVE the first data cell (same x-alignment)
+     - One directly LEFT of the first data cell (same y-alignment)
+     Both touch the top-left corner of the first data cell:
+
+                   [mag_top 24x24]
+     [mag_left 24x24] [first cell] [cell 2] [cell 3] ...
+
+  4. Save as PNG (compression 0, no interlacing)
+
+REFERENCE IMAGES (in ./refimages/):
+  Blue_10_block.png                          → Normal (skip)
+  Yellow_border_F.png                        → Ferien
+  Yellow_border_Wo2.png                      → Weiterbildung
+  Split_cell_10__top_Ps_bottom.png           → Dienst
+  Split_cell_plain_blue_dash_top_Ps_bottom.png → Dienst
+  Split_cell_W__top_Ps_bottom.png            → Weiterbildung+Dienst
+  Plain_bue_dash_bright.png                  → Frei
+  Plain_bue_dash_dark.png                    → Frei
+  (Add more as needed — just follow the naming pattern)
 
 Usage:
-    python3 schedule_parser.py <screenshot.png> [--year 2026] [--month 5] [--output out.csv]
-
-Requirements:
-    pip install Pillow numpy
+  python3 schedule_parser.py screenshot.png --year 2026 --month 4 --day 27
+  python3 schedule_parser.py screenshot.png --year 2026 --month 4 --day 27 --debug
 """
 
 import argparse
+import calendar as cal_module
 import csv
+import os
 import sys
-from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Blue anchor color range (the highlighted cells you set manually)
-# Adjust tolerance if your blue is slightly different
-BLUE_HUE_MIN = (0, 80, 180)    # min R, G, B
-BLUE_HUE_MAX = (120, 180, 255)  # max R, G, B
-BLUE_MIN_PIXELS = 30            # minimum blue pixels to count as a blue cell
+GRID_LINE = 1         # grid line width in pixels
 
-# Symbol classification thresholds
-YELLOW_BORDER_THRESHOLD = 180   # R and G must exceed this, B must be below
-YELLOW_B_MAX = 120
-LIGHT_BLUE_MIN = 150            # for normal "10" cells
-GRAY_DIFF_MAX = 25              # R/G/B similarity threshold for gray/dash cells
+# Magenta detection
+MAGENTA_R_MIN = 200
+MAGENTA_G_MAX = 50
+MAGENTA_B_MIN = 200
+MAGENTA_MIN_PIXELS = 100
 
-# Days of week in German schedule headers
+# Reference image directory
+REF_DIR = "./refimages"
+
+# Mapping from reference filename to calendar category
+# Add new reference images here — the script auto-loads them
+REF_MAP = {
+    "Blue_10_block.png":                          "Normal",
+    "Yellow_border_F.png":                        "Ferien",
+    "Yellow_border_Wo2.png":                      "Weiterbildung",
+    "Split_cell_10__top_Ps_bottom.png":           "Dienst",
+    "Split_cell_plain_blue_dash_top_Ps_bottom.png": "Dienst",
+    "Split_cell_W__top_Ps_bottom.png":            "Weiterbildung+Dienst",
+    "Plain_bue_dash_bright.png":                  "Frei",
+    "Plain_bue_dash_dark.png":                    "Frei",
+    "Yellow_border_W.png":                        "Weiterbildung",
+}
+
 WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 WEEKEND = {"Sa", "So"}
 
 # ---------------------------------------------------------------------------
-# Blue cell detection
+# Reference image loading
 # ---------------------------------------------------------------------------
 
-def is_blue_pixel(r, g, b):
-    return (BLUE_HUE_MIN[0] <= r <= BLUE_HUE_MAX[0] and
-            BLUE_HUE_MIN[1] <= g <= BLUE_HUE_MAX[1] and
-            BLUE_HUE_MIN[2] <= b <= BLUE_HUE_MAX[2])
+def cell_signature(arr):
+    """
+    Compute a 9-dimensional color signature for a cell:
+    [full_R, full_G, full_B, upper_R, upper_G, upper_B, lower_R, lower_G, lower_B]
+    """
+    f = arr.astype(float)
+    h = f.shape[0]
+    full = f.reshape(-1, 3).mean(axis=0)
+    upper = f[:h//2].reshape(-1, 3).mean(axis=0)
+    lower = f[h//2:].reshape(-1, 3).mean(axis=0)
+    return np.concatenate([full, upper, lower])
 
 
-def find_blue_regions(arr):
-    """Return list of (x1, y1, x2, y2) bounding boxes of blue regions."""
-    mask = np.zeros(arr.shape[:2], dtype=bool)
-    for y in range(arr.shape[0]):
-        for x in range(arr.shape[1]):
-            r, g, b = arr[y, x]
-            if is_blue_pixel(r, g, b):
-                mask[y, x] = True
+def load_references(ref_dir):
+    """Load reference images and build signature database."""
+    ref_sigs = []
+    ref_labels = []
+    ref_names = []
 
-    # Find connected components via simple flood-fill grouping
+    for fname, label in REF_MAP.items():
+        path = os.path.join(ref_dir, fname)
+        if not os.path.exists(path):
+            print(f"  WARNING: Reference image not found: {path}")
+            continue
+        arr = np.array(Image.open(path).convert("RGB"))
+        sig = cell_signature(arr)
+        ref_sigs.append(sig)
+        ref_labels.append(label)
+        ref_names.append(fname)
+
+    if not ref_sigs:
+        print(f"ERROR: No reference images found in {ref_dir}")
+        sys.exit(1)
+
+    return np.array(ref_sigs), ref_labels, ref_names
+
+
+def classify_cell(cell_arr, ref_sigs, ref_labels, ref_names):
+    """
+    Classify a cell by finding the nearest reference image (Euclidean distance
+    on the 9-dim color signature).
+    Returns (label, distance, matched_reference_name).
+    """
+    sig = cell_signature(cell_arr)
+    distances = np.linalg.norm(ref_sigs - sig, axis=1)
+    best_idx = np.argmin(distances)
+    return ref_labels[best_idx], distances[best_idx], ref_names[best_idx]
+
+# ---------------------------------------------------------------------------
+# Magenta anchor detection
+# ---------------------------------------------------------------------------
+
+def find_magenta_anchors(arr):
+    """
+    Find two magenta anchor blocks (each 24x24):
+      - mag_top:  placed ABOVE the first data cell → defines column x-position
+      - mag_left: placed LEFT of the first data cell → defines row y-position
+
+    Layout:
+                  [mag_top]
+      [mag_left]  [first data cell] [cell 2] ...
+
+    Both touch the top-left corner of the first data cell.
+    Returns (mag_top_box, mag_left_box, pixel_count) where each box is (x1,y1,x2,y2),
+    or (None, None, pixel_count) on failure.
+    """
+    mask = (
+        (arr[:, :, 0] >= MAGENTA_R_MIN) &
+        (arr[:, :, 1] <= MAGENTA_G_MAX) &
+        (arr[:, :, 2] >= MAGENTA_B_MIN)
+    )
+
+    count = int(mask.sum())
+    if count < MAGENTA_MIN_PIXELS:
+        return None, None, count
+
+    # Find connected components via flood fill
     visited = np.zeros_like(mask)
     regions = []
+    ys_all, xs_all = np.where(mask)
 
-    def bbox(ys, xs):
-        return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+    for start_y, start_x in zip(ys_all, xs_all):
+        if visited[start_y, start_x]:
+            continue
+        queue = [(int(start_y), int(start_x))]
+        component_ys = []
+        component_xs = []
+        head = 0
+        while head < len(queue):
+            cy, cx = queue[head]
+            head += 1
+            if cy < 0 or cy >= mask.shape[0] or cx < 0 or cx >= mask.shape[1]:
+                continue
+            if visited[cy, cx] or not mask[cy, cx]:
+                continue
+            visited[cy, cx] = True
+            component_ys.append(cy)
+            component_xs.append(cx)
+            for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                queue.append((cy+dy, cx+dx))
 
-    for y in range(mask.shape[0]):
-        for x in range(mask.shape[1]):
-            if mask[y, x] and not visited[y, x]:
-                # BFS
-                queue = [(y, x)]
-                ys, xs = [], []
-                while queue:
-                    cy, cx = queue.pop()
-                    if cy < 0 or cy >= mask.shape[0] or cx < 0 or cx >= mask.shape[1]:
-                        continue
-                    if visited[cy, cx] or not mask[cy, cx]:
-                        continue
-                    visited[cy, cx] = True
-                    ys.append(cy)
-                    xs.append(cx)
-                    for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
-                        queue.append((cy+dy, cx+dx))
-                if len(ys) >= BLUE_MIN_PIXELS:
-                    regions.append(bbox(np.array(ys), np.array(xs)))
+        if len(component_ys) >= 50:  # minimum pixels for a real anchor
+            regions.append((
+                min(component_xs), min(component_ys),
+                max(component_xs), max(component_ys)
+            ))
 
-    return regions
-
-
-def find_anchors(arr):
-    """
-    Find the two blue anchor cells:
-      - Header cell: topmost blue region  → defines column 1 x-position and cell width
-      - Name cell:   leftmost blue region → defines Steven's row y-position and cell height
-    Returns (header_box, name_box) as (x1,y1,x2,y2) tuples.
-    """
-    regions = find_blue_regions(arr)
     if len(regions) < 2:
-        raise ValueError(f"Expected 2 blue anchor regions, found {len(regions)}. "
-                         "Make sure both the first day column header and Steven's name cell are highlighted blue.")
+        return None, None, count
 
-    # Sort by y (top to bottom) → header cell comes first
-    regions_sorted_y = sorted(regions, key=lambda r: r[1])
-    header_box = regions_sorted_y[0]  # topmost = day header
+    # Identify which is top and which is left:
+    # mag_top has the smaller y1 (higher up)
+    # mag_left has the smaller x1 (further left)
+    # Since they share a corner, mag_top is higher and mag_left is more to the left
+    regions_by_y = sorted(regions, key=lambda r: r[1])
+    mag_top = regions_by_y[0]   # topmost = above first cell
+    mag_left = regions_by_y[1]  # lower = left of first cell
 
-    # Sort by x (left to right) → name cell comes first
-    regions_sorted_x = sorted(regions, key=lambda r: r[0])
-    name_box = regions_sorted_x[0]    # leftmost = name cell
-
-    if header_box == name_box:
-        raise ValueError("Only one unique blue region found. Need two separate blue cells.")
-
-    return header_box, name_box
+    return mag_top, mag_left, count
 
 # ---------------------------------------------------------------------------
 # Grid derivation
 # ---------------------------------------------------------------------------
 
-def derive_grid(header_box, name_box):
+def derive_grid(mag_top, mag_left):
     """
-    From the two anchor boxes derive:
-      - cell_w, cell_h
-      - col1_x: x start of first data column
-      - steven_y: y start of Steven's row
+    From two magenta anchor blocks, derive the grid origin.
+
+    Layout:
+                  [mag_top]
+      [mag_left]  [first data cell]
+
+    - mag_top defines the x-position: first cell x = mag_top x1
+      (mag_top is directly above the first cell, same x-alignment)
+    - mag_left defines the y-position: first cell y = mag_left y1
+      (mag_left is directly left of the first cell, same y-alignment)
+    - Cell size is derived from mag_top width and mag_left height
     """
-    hx1, hy1, hx2, hy2 = header_box
-    nx1, ny1, nx2, ny2 = name_box
+    tx1, ty1, tx2, ty2 = mag_top
+    lx1, ly1, lx2, ly2 = mag_left
 
-    cell_w = hx2 - hx1
-    cell_h = hy2 - hy1
+    cell_w = tx2 - tx1 + 1  # width from top anchor
+    cell_h = ly2 - ly1 + 1  # height from left anchor
 
-    col1_x = hx1   # first data column starts at header cell x
-    steven_y = ny1  # Steven's row starts at name cell y
+    first_cell_x = tx1       # same x as top anchor
+    steven_y = ly1            # same y as left anchor
 
-    return cell_w, cell_h, col1_x, steven_y
+    return first_cell_x, steven_y, cell_w, cell_h
 
 
-def scan_columns(arr, col1_x, steven_y, cell_w, cell_h, img_width):
-    """
-    Scan rightward from col1_x, extracting cell arrays for Steven's row.
-    Stop when we run out of image or hit a clearly empty region.
-    Returns list of numpy arrays (one per day column).
-    """
+def extract_cells(arr, first_cell_x, steven_y, cell_w, cell_h, img_width):
+    """Extract all data cells from Steven's row."""
     cells = []
-    x = col1_x
+    x = first_cell_x
+    pitch = cell_w + GRID_LINE
     while x + cell_w <= img_width:
         cell = arr[steven_y:steven_y + cell_h, x:x + cell_w]
-        cells.append((x, cell))
-        x += cell_w
+        if cell.shape[0] == cell_h and cell.shape[1] == cell_w:
+            cells.append((x, cell))
+        x += pitch
     return cells
-
-# ---------------------------------------------------------------------------
-# Cell classification
-# ---------------------------------------------------------------------------
-
-def has_yellow_border(cell):
-    """Check if cell has a yellow border (Ferien / Weiterbildung)."""
-    border = np.concatenate([
-        cell[:2, :].reshape(-1, 3),
-        cell[-2:, :].reshape(-1, 3),
-        cell[:, :2].reshape(-1, 3),
-        cell[:, -2:].reshape(-1, 3),
-    ])
-    avg = border.mean(axis=0)
-    return (avg[0] > YELLOW_BORDER_THRESHOLD and
-            avg[1] > YELLOW_BORDER_THRESHOLD - 20 and
-            avg[2] < YELLOW_B_MAX)
-
-
-def has_dienst_lower(cell):
-    """
-    Check for Dienst symbol (P+letter) in lower half of cell.
-    Dienst lower half has a green/teal tinge distinct from the blue 10 block.
-    """
-    h = cell.shape[0]
-    lower = cell[h//2:, 3:-3]
-    if lower.size == 0:
-        return False
-    avg = lower.reshape(-1, 3).mean(axis=0)
-    # Dienst lower half: greenish-teal, G and B higher than R, not the cyan of normal 10
-    return (avg[1] > avg[0] + 15 and avg[2] > avg[0] + 10 and avg[0] < 180)
-
-
-def has_letter_in_upper(cell, letter):
-    """
-    Heuristic: check if upper half of cell has yellow border (for combined cells).
-    """
-    h = cell.shape[0]
-    upper = cell[:h//2, :]
-    border = np.concatenate([
-        upper[:2, :].reshape(-1, 3),
-        upper[:, :2].reshape(-1, 3),
-        upper[:, -2:].reshape(-1, 3),
-    ])
-    if border.size == 0:
-        return False
-    avg = border.reshape(-1, 3).mean(axis=0)
-    return (avg[0] > YELLOW_BORDER_THRESHOLD and
-            avg[1] > YELLOW_BORDER_THRESHOLD - 20 and
-            avg[2] < YELLOW_B_MAX)
-
-
-def is_normal_workday(cell):
-    """Light blue 10 block."""
-    center = cell[3:-3, 3:-3]
-    if center.size == 0:
-        return False
-    avg = center.reshape(-1, 3).mean(axis=0)
-    return (avg[2] > avg[0] + 20 and avg[1] > avg[0] + 10 and avg[0] > 130)
-
-
-def is_dash_frei(cell):
-    """Gray or lightly tinted dash cell."""
-    center = cell[3:-3, 3:-3]
-    if center.size == 0:
-        return False
-    avg = center.reshape(-1, 3).mean(axis=0)
-    diff_rg = abs(int(avg[0]) - int(avg[1]))
-    diff_gb = abs(int(avg[1]) - int(avg[2]))
-    return avg[0] > 140 and diff_rg < GRAY_DIFF_MAX and diff_gb < GRAY_DIFF_MAX
-
-
-def classify_cell(cell):
-    """
-    Returns one of:
-      'Ferien', 'Weiterbildung', 'Dienst', 'Ferien+Dienst',
-      'Weiterbildung+Dienst', 'Frei', 'Normal', '?'
-    """
-    yellow = has_yellow_border(cell)
-    dienst_lower = has_dienst_lower(cell)
-    normal = is_normal_workday(cell)
-    frei = is_dash_frei(cell)
-
-    # Combined: yellow upper + dienst lower
-    if yellow and dienst_lower:
-        # Distinguish F vs W by checking center of upper half for dark blue (F has dark bg)
-        h = cell.shape[0]
-        upper_center = cell[2:h//2-2, 4:-4]
-        if upper_center.size > 0:
-            uc_avg = upper_center.reshape(-1, 3).mean(axis=0)
-            if uc_avg[2] > 100 and uc_avg[0] < 100:
-                return "Ferien+Dienst"
-        return "Weiterbildung+Dienst"
-
-    if yellow:
-        # Distinguish Ferien (F, dark blue bg) from Weiterbildung (W, dark blue bg)
-        # Both have dark blue center — differentiate by checking for 'W' shape pixels
-        # As a heuristic: Weiterbildung cells often have Wo2 text which adds lighter pixels
-        # For now flag as uncertain between the two — use '?' and let user confirm
-        # Actually from training: both F and W have identical color profile
-        # We'll use the center darkness: F tends to be slightly darker blue
-        center = cell[4:-4, 4:-4]
-        if center.size > 0:
-            avg = center.reshape(-1, 3).mean(axis=0)
-            if avg[2] > avg[0] + 30 and avg[0] < 80:
-                return "Ferien"        # very dark blue center = F
-            elif avg[2] > avg[0] + 15:
-                return "Weiterbildung" # slightly lighter = W
-        return "Ferien?"
-
-    if normal and dienst_lower:
-        return "Dienst"   # combined 10/Ps cell
-
-    if dienst_lower:
-        return "Dienst"
-
-    if normal:
-        return "Normal"
-
-    if frei:
-        return "Frei"
-
-    return "?"
 
 # ---------------------------------------------------------------------------
 # Date helpers
 # ---------------------------------------------------------------------------
 
-import calendar as cal_module
-
 def day_of_week(year, month, day):
-    """Return German day abbreviation."""
-    weekday = cal_module.weekday(year, month, day)
-    return WEEKDAYS[weekday]
-
+    return WEEKDAYS[cal_module.weekday(year, month, day)]
 
 def days_in_month(year, month):
     return cal_module.monthrange(year, month)[1]
@@ -296,14 +256,12 @@ def days_in_month(year, month):
 # ---------------------------------------------------------------------------
 
 def to_csv(assignments, output_path):
-    """Write Google Calendar CSV."""
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Subject", "Start Date", "End Date", "All Day Event", "Description"])
         for date_str, assignment in assignments:
             for entry in assignment.split("+"):
-                entry = entry.strip()
-                writer.writerow([entry, date_str, date_str, "TRUE", ""])
+                writer.writerow([entry.strip(), date_str, date_str, "TRUE", ""])
     print(f"Saved CSV: {output_path}")
 
 # ---------------------------------------------------------------------------
@@ -311,54 +269,85 @@ def to_csv(assignments, output_path):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse schedule screenshot for Vitéz Steven.")
-    parser.add_argument("image", help="Path to screenshot PNG/JPG")
-    parser.add_argument("--year",  type=int, required=True, help="Year of the schedule (e.g. 2026)")
-    parser.add_argument("--month", type=int, required=True, help="Month of the first visible day (1-12)")
-    parser.add_argument("--day",   type=int, default=1,     help="Day number of the first visible column (default: 1)")
-    parser.add_argument("--output", default="schedule.csv", help="Output CSV filename")
-    parser.add_argument("--debug", action="store_true", help="Save debug contact sheet")
+    parser = argparse.ArgumentParser(
+        description="Parse schedule screenshot for Vitéz Steven.",
+        epilog="Place a 24x24 magenta (#ff00ff) anchor at the top-left corner "
+               "of the first data cell before running."
+    )
+    parser.add_argument("image", help="Path to screenshot PNG")
+    parser.add_argument("--year",  type=int, required=True)
+    parser.add_argument("--month", type=int, required=True, help="Month of first visible day")
+    parser.add_argument("--day",   type=int, default=1,     help="Day number of first visible column")
+    parser.add_argument("--output", default="schedule.csv")
+    parser.add_argument("--refdir", default=REF_DIR, help="Path to reference images directory")
+    parser.add_argument("--debug", action="store_true", help="Save debug images and verbose output")
+    parser.add_argument("--threshold", type=float, default=60.0,
+                        help="Max distance to accept a match (default: 60). "
+                             "Higher = more tolerant, lower = stricter.")
     args = parser.parse_args()
 
+    # --- Load image ---
     img = Image.open(args.image).convert("RGB")
     arr = np.array(img)
+    print(f"Image: {img.size[0]}x{img.size[1]}")
 
-    print(f"Image size: {img.size}")
-    print("Searching for blue anchor cells...")
+    # --- Load references ---
+    print(f"Loading references from {args.refdir}/")
+    ref_sigs, ref_labels, ref_names = load_references(args.refdir)
+    print(f"  Loaded {len(ref_sigs)} reference(s)")
 
-    try:
-        header_box, name_box = find_anchors(arr)
-    except ValueError as e:
-        print(f"ERROR: {e}")
+    # --- Find magenta anchors ---
+    print("Searching for magenta anchors...")
+    mag_top, mag_left, pixel_count = find_magenta_anchors(arr)
+
+    if mag_top is None or mag_left is None:
+        print(f"\nERROR: Need 2 magenta anchor blocks, found fewer ({pixel_count} magenta pixels).")
+        print("Instructions:")
+        print("  1. Open screenshot in GIMP")
+        print("  2. Paint TWO 24x24px filled rectangles with #ff00ff (magenta)")
+        print("  3. Place one ABOVE the first data cell (same x-alignment)")
+        print("  4. Place one LEFT of the first data cell (same y-alignment)")
+        print("  5. Both should touch the top-left corner of the first data cell")
+        print("  6. Export as PNG (compression 0)")
         sys.exit(1)
 
-    print(f"  Header cell (day anchor): x={header_box[0]}-{header_box[2]}, y={header_box[1]}-{header_box[3]}")
-    print(f"  Name cell  (row anchor):  x={name_box[0]}-{name_box[2]}, y={name_box[1]}-{name_box[3]}")
+    tx1, ty1, tx2, ty2 = mag_top
+    lx1, ly1, lx2, ly2 = mag_left
+    tw, th = tx2-tx1+1, ty2-ty1+1
+    lw, lh = lx2-lx1+1, ly2-ly1+1
+    print(f"  Top anchor:  ({tx1},{ty1})-({tx2},{ty2}), size {tw}x{th}")
+    print(f"  Left anchor: ({lx1},{ly1})-({lx2},{ly2}), size {lw}x{lh}")
 
-    cell_w, cell_h, col1_x, steven_y = derive_grid(header_box, name_box)
-    print(f"  Cell size: {cell_w}w x {cell_h}h px")
-    print(f"  Grid origin: col1_x={col1_x}, steven_y={steven_y}")
+    # --- Derive grid (cell size auto-detected from anchors) ---
+    first_cell_x, steven_y, cell_w, cell_h = derive_grid(mag_top, mag_left)
+    cell_pitch = cell_w + GRID_LINE
+    print(f"  Auto-detected cell size: {cell_w}x{cell_h}, pitch={cell_pitch}")
+    print(f"  Grid: first_cell_x={first_cell_x}, steven_y={steven_y}")
 
-    cells = scan_columns(arr, col1_x, steven_y, cell_w, cell_h, img.width)
-    print(f"  Found {len(cells)} day columns")
+    # --- Extract cells ---
+    cells = extract_cells(arr, first_cell_x, steven_y, cell_w, cell_h, img.width)
+    print(f"  Extracted {len(cells)} day columns")
 
-    # Build date sequence starting from args.year, args.month, args.day
+    if len(cells) == 0:
+        print("ERROR: No cells extracted. Check anchor placement.")
+        sys.exit(1)
+
+    # --- Classify each cell ---
     year, month, day = args.year, args.month, args.day
     assignments = []
     uncertain = []
     skipped = 0
 
-    print("\nClassification:")
+    print(f"\nClassification (threshold={args.threshold}):")
     for i, (x_pos, cell_arr) in enumerate(cells):
         dow = day_of_week(year, month, day)
         is_weekend = dow in WEEKEND
         date_str = f"{month:02d}/{day:02d}/{year}"
-        label = classify_cell(cell_arr)
+        display_date = f"{day:02d}.{month:02d}.{year}"
+
+        label, dist, matched = classify_cell(cell_arr, ref_sigs, ref_labels, ref_names)
 
         # Advance date
-        current_day = day
-        current_month = month
-        current_year = year
         day += 1
         if day > days_in_month(year, month):
             day = 1
@@ -367,7 +356,17 @@ def main():
                 month = 1
                 year += 1
 
-        # Apply rules
+        # Check confidence
+        if dist > args.threshold:
+            uncertain.append((date_str, display_date, dow, label, dist, matched))
+            if args.debug:
+                print(f"  {display_date} {dow}: {label:25s} dist={dist:5.1f} ← UNCERTAIN (>{args.threshold}) [{matched}]")
+            continue
+
+        if args.debug:
+            print(f"  {display_date} {dow}: {label:25s} dist={dist:5.1f} [{matched}]")
+
+        # Apply skip rules
         if label == "Normal":
             skipped += 1
             continue
@@ -376,43 +375,60 @@ def main():
             continue
         if label == "Frei" and not is_weekend:
             assignments.append((date_str, "Frei"))
-            print(f"  {date_str} {dow}: Frei")
-            continue
-        if "?" in label:
-            uncertain.append((date_str, dow, label))
-            print(f"  {date_str} {dow}: {label} ← UNCERTAIN")
+            if not args.debug:
+                print(f"  {display_date} {dow}: Frei")
             continue
 
         assignments.append((date_str, label))
-        print(f"  {date_str} {dow}: {label}")
+        if not args.debug:
+            print(f"  {display_date} {dow}: {label}")
 
-    print(f"\nTotal: {len(assignments)} entries, {skipped} skipped (normal/weekend), {len(uncertain)} uncertain")
+    print(f"\nSummary: {len(assignments)} entries, {skipped} skipped, {len(uncertain)} uncertain")
 
     if uncertain:
-        print("\nUncertain cells requiring manual confirmation:")
-        for date_str, dow, label in uncertain:
-            print(f"  {date_str} {dow}: {label}")
+        print("\nUncertain cells (distance > threshold) — please check:")
+        for date_str, display_date, dow, label, dist, matched in uncertain:
+            print(f"  {display_date} {dow}: best guess={label}, dist={dist:.1f}, matched={matched}")
 
+    # --- Debug output ---
     if args.debug:
-        # Save contact sheet of all cells
-        from PIL import ImageDraw
+        # Grid overlay on original
+        debug_img = img.copy()
+        draw = ImageDraw.Draw(debug_img)
+        # Draw anchor boxes
+        draw.rectangle([tx1, ty1, tx2, ty2], outline="magenta", width=2)
+        draw.rectangle([lx1, ly1, lx2, ly2], outline="magenta", width=2)
+        # Draw cell grid
+        for i, (x_pos, _) in enumerate(cells):
+            draw.rectangle(
+                [x_pos, steven_y, x_pos + cell_w - 1, steven_y + cell_h - 1],
+                outline="red", width=1
+            )
+        debug_img.save("debug_grid.png")
+        print("Saved debug_grid.png")
+
+        # Contact sheet
         scale = 4
         pad = 3
-        sh = cell_h * scale + 20
-        sw = len(cells) * (cell_w * scale + pad) + pad
-        sheet = Image.new("RGB", (sw, sh), (220, 220, 220))
-        draw = ImageDraw.Draw(sheet)
-        for i, (_, cell_arr) in enumerate(cells):
-            cell_img = Image.fromarray(cell_arr)
-            scaled = cell_img.resize((cell_w * scale, cell_h * scale), Image.NEAREST)
-            xp = pad + i * (cell_w * scale + pad)
-            sheet.paste(scaled, (xp, 0))
-            draw.text((xp + 2, cell_h * scale + 4), str(i+1), fill=(0,0,0))
-        sheet.save("debug_cells.png")
-        print("Saved debug_cells.png")
+        n = len(cells)
+        sh = cell_h * scale + 25
+        sw = n * (cell_w * scale + pad) + pad
+        if sw > 0:
+            sheet = Image.new("RGB", (sw, sh), (220, 220, 220))
+            sdraw = ImageDraw.Draw(sheet)
+            for i, (_, cell_arr) in enumerate(cells):
+                cell_img = Image.fromarray(cell_arr)
+                scaled = cell_img.resize(
+                    (cell_w * scale, cell_h * scale), Image.NEAREST)
+                xp = pad + i * (cell_w * scale + pad)
+                sheet.paste(scaled, (xp, 0))
+                sdraw.text((xp + 2, cell_h * scale + 4), str(i+1), fill=(0,0,0))
+            sheet.save("debug_cells.png")
+            print("Saved debug_cells.png")
 
+    # --- CSV ---
     to_csv(assignments, args.output)
-    print("\nDone. Import the CSV into Google Calendar via:")
+    print(f"\nDone. Import {args.output} into Google Calendar via:")
     print("  calendar.google.com → Settings → Import & Export → Import")
 
 
