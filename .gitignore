@@ -20,7 +20,7 @@ debug_cells.png
 Thumbs.db
 
 # gimp
-.xcf
+/*.xcf
 
 # Identifiers and system files
 .identifier
