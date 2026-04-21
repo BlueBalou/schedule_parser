@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+ 
+# Output files
+*.csv
+debug_cells.png
+ 
+# Screenshots and input images
+*.png
+*.jpg
+*.jpeg
+ 
+# OS
+.DS_Store
+Thumbs.db
+ 
